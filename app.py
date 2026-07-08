@@ -293,17 +293,18 @@ def scrape_post_content(post_id):
         return None, str(e)
 
 # 5. TTS Helpers
-async def generate_edge_tts(text, output_path, voice, rate):
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
+async def generate_edge_tts(text, output_path, voice, rate, volume):
+    communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
     await communicate.save(output_path)
 
-def get_tts_audio(text, post_id, voice, speed_rate):
+def get_tts_audio(text, post_id, voice, speed_rate, volume_rate="+0%"):
     os.makedirs(".cache", exist_ok=True)
     
     # Generate unique cached file name
     safe_voice = voice.replace(":", "_").replace("-", "_")
     safe_rate = speed_rate.replace("+", "p").replace("-", "m").replace("%", "")
-    audio_filename = f"audio_{post_id}_{safe_voice}_{safe_rate}.mp3"
+    safe_volume = volume_rate.replace("+", "p").replace("-", "m").replace("%", "")
+    audio_filename = f"audio_{post_id}_{safe_voice}_{safe_rate}_{safe_volume}.mp3"
     audio_path = os.path.join(".cache", audio_filename)
     
     if os.path.exists(audio_path):
@@ -311,7 +312,7 @@ def get_tts_audio(text, post_id, voice, speed_rate):
         
     try:
         # Run async TTS generator synchronously
-        asyncio.run(generate_edge_tts(text, audio_path, voice, speed_rate))
+        asyncio.run(generate_edge_tts(text, audio_path, voice, speed_rate, volume_rate))
         return audio_path, None
     except Exception as e:
         # Fallback to standard Google TTS
@@ -354,33 +355,37 @@ if not posts:
 if "selected_post" not in st.session_state:
     st.session_state.selected_post = posts[0]
 
+if "list_expanded" not in st.session_state:
+    st.session_state.list_expanded = True
+
 # --- Left Column: Post List ---
 with col_left:
-    st.markdown("### 📝 최신 포스트 목록")
-    
-    # Search / Filter
-    search_query = st.text_input("🔍 글 검색", "", placeholder="제목을 입력하세요...")
-    
-    filtered_posts = posts
-    if search_query:
-        filtered_posts = [p for p in posts if search_query.lower() in p["title"].lower()]
+    # Use expander with session state to let user collapse/expand the list (great for mobile)
+    with st.expander("📝 최신 포스트 목록 (접기/펴기)", expanded=st.session_state.list_expanded):
+        # Search / Filter
+        search_query = st.text_input("🔍 글 검색", "", placeholder="제목을 입력하세요...")
         
-    # Render custom HTML list
-    for idx, post in enumerate(filtered_posts):
-        is_selected = post["post_id"] == st.session_state.selected_post["post_id"]
-        active_class = "post-card-active" if is_selected else ""
-        
-        # We can use st.button styled as card or handle click using streamlit keys
-        button_label = f"[{post['published']}] {post['title']}"
-        
-        # Using Streamlit columns & expander or custom button list
-        if st.button(
-            f"{'▶ ' if is_selected else ''}{post['title']}\n({post['published']})",
-            key=f"post_{post['post_id']}_{idx}",
-            use_container_width=True,
-        ):
-            st.session_state.selected_post = post
-            st.rerun()
+        filtered_posts = posts
+        if search_query:
+            filtered_posts = [p for p in posts if search_query.lower() in p["title"].lower()]
+            
+        # Render custom HTML list
+        for idx, post in enumerate(filtered_posts):
+            is_selected = post["post_id"] == st.session_state.selected_post["post_id"]
+            active_class = "post-card-active" if is_selected else ""
+            
+            # We can use st.button styled as card or handle click using streamlit keys
+            button_label = f"[{post['published']}] {post['title']}"
+            
+            # Using Streamlit columns & expander or custom button list
+            if st.button(
+                f"{'▶ ' if is_selected else ''}{post['title']}\n({post['published']})",
+                key=f"post_{post['post_id']}_{idx}",
+                use_container_width=True,
+            ):
+                st.session_state.selected_post = post
+                st.session_state.list_expanded = False  # Auto-collapse on mobile when selected
+                st.rerun()
 
 # --- Right Column: Reader & TTS ---
 selected_post = st.session_state.selected_post
@@ -413,13 +418,13 @@ with col_right:
             st.stop()
             
         # TTS Settings Drawer/Expander
-        with st.expander("⚙️ TTS 음성 및 속도 설정", expanded=False):
-            voice_col, speed_col = st.columns(2)
+        with st.expander("⚙️ TTS 음성, 속도 및 볼륨 설정", expanded=False):
+            voice_col, speed_col, volume_col = st.columns(3)
             
             with voice_col:
                 voice_options = {
-                    "ko-KR-SunHiNeural (여성 - 기본)": "ko-KR-SunHiNeural",
-                    "ko-KR-InJoonNeural (남성 - 차분함)": "ko-KR-InJoonNeural",
+                    "ko-KR-InJoonNeural (남성 - 차분함, 기본)": "ko-KR-InJoonNeural",
+                    "ko-KR-SunHiNeural (여성 - 선명함)": "ko-KR-SunHiNeural",
                     "ko-KR-HyunminNeural (남성 - 친근함)": "ko-KR-HyunminNeural"
                 }
                 selected_voice_name = st.selectbox(
@@ -443,6 +448,21 @@ with col_right:
                     index=1 # Default 1.0x
                 )
                 speed_rate = speed_options[selected_speed_name]
+                
+            with volume_col:
+                selected_volume = st.slider(
+                    "음량 조절",
+                    min_value=50,
+                    max_value=150,
+                    value=100,
+                    step=10,
+                    format="%d%%"
+                )
+                # Map 100% to "+0%", 120% to "+20%", 80% to "-20%"
+                if selected_volume == 100:
+                    volume_rate = "+0%"
+                else:
+                    volume_rate = f"{selected_volume - 100:+.0f}%"
         
         # Compile full text for TTS conversion
         # Join paragraphs with periods to ensure natural pausing
@@ -460,7 +480,7 @@ with col_right:
         audio_status_placeholder = st.empty()
         
         # Audio file path
-        audio_path, tts_warning = get_tts_audio(full_text, selected_post["post_id"], voice_id, speed_rate)
+        audio_path, tts_warning = get_tts_audio(full_text, selected_post["post_id"], voice_id, speed_rate, volume_rate)
         
         if tts_warning:
             st.warning(tts_warning)
