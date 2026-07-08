@@ -26,6 +26,14 @@ def toggle_theme():
 
 IS_DARK = st.session_state.theme == "dark"
 
+# Initialize TTS settings in session state to prevent intermediate slider run conflicts
+if "tts_voice" not in st.session_state:
+    st.session_state.tts_voice = "ko-KR-InJoonNeural (남성 - 차분함, 기본)"
+if "tts_speed" not in st.session_state:
+    st.session_state.tts_speed = "1.0x (보통)"
+if "tts_volume" not in st.session_state:
+    st.session_state.tts_volume = 100
+
 # 3. CSS Design System (Theme-aware UI)
 bg_color = "#09090b" if IS_DARK else "#ffffff"
 bg_subtle = "#0c0c0f" if IS_DARK else "#f9fafb"
@@ -82,41 +90,25 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"], .main, .b
     color: {accent_color};
 }}
 
-/* Custom Post Card in Sidebar */
-.post-card {{
-    background-color: {card_color};
-    border: 1px solid {border_color};
-    border-radius: 8px;
-    padding: 1rem;
-    margin-bottom: 0.75rem;
-    cursor: pointer;
-    transition: all 0.2s ease;
+/* Custom styling for list buttons */
+div[data-testid="stButton"] button {{
+    text-align: left !important;
+    white-space: normal !important;
+    word-break: break-all !important;
+    height: auto !important;
+    padding: 0.75rem 1rem !important;
+    background-color: {card_color} !important;
+    border: 1px solid {border_color} !important;
+    color: {text_color} !important;
+    font-size: 0.85rem !important;
+    line-height: 1.4 !important;
+    border-radius: 8px !important;
+    transition: all 0.2s ease !important;
 }}
-.post-card:hover {{
-    background-color: {card_hover};
-    border-color: {accent_color};
-    transform: translateY(-1px);
-}}
-.post-card-active {{
-    background-color: {card_hover};
-    border-color: {accent_color};
-    box-shadow: 0 0 0 1px {accent_color};
-}}
-.post-card-title {{
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: {text_color};
-    line-height: 1.3;
-    margin-bottom: 0.4rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-}}
-.post-card-date {{
-    font-size: 0.75rem;
-    color: {text_muted};
+div[data-testid="stButton"] button:hover {{
+    border-color: {accent_color} !important;
+    background-color: {card_hover} !important;
+    color: {accent_color} !important;
 }}
 
 /* Reader UI styling */
@@ -293,6 +285,8 @@ def scrape_post_content(post_id):
         return None, str(e)
 
 # 5. TTS Helpers
+import traceback
+
 async def generate_edge_tts(text, output_path, voice, rate, volume):
     communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
     await communicate.save(output_path)
@@ -315,18 +309,20 @@ def get_tts_audio(text, post_id, voice, speed_rate, volume_rate="+0%"):
         asyncio.run(generate_edge_tts(text, audio_path, voice, speed_rate, volume_rate))
         return audio_path, None
     except Exception as e:
+        err_msg = f"Edge TTS 오류: {str(e)}"
         # Fallback to standard Google TTS
         try:
             fallback_filename = f"audio_{post_id}_gtts.mp3"
             fallback_path = os.path.join(".cache", fallback_filename)
             if os.path.exists(fallback_path):
-                return fallback_path, f"Edge TTS 오류로 Google TTS 캐시를 로드했습니다. ({str(e)})"
+                return fallback_path, f"Edge TTS 오류로 Google TTS 캐시를 로드했습니다. ({err_msg})"
             
             tts = gTTS(text=text, lang='ko')
             tts.save(fallback_path)
-            return fallback_path, f"Edge TTS 오류로 Google TTS를 사용해 임시 생성했습니다. ({str(e)})"
+            return fallback_path, f"Edge TTS 오류로 Google TTS를 사용해 임시 생성했습니다. ({err_msg})"
         except Exception as fallback_err:
-            return None, f"TTS 생성 실패: {str(e)} / Fallback 오류: {str(fallback_err)}"
+            fallback_err_msg = f"Fallback gTTS 오류: {str(fallback_err)}"
+            return None, f"TTS 생성 실패!\n\n1. {err_msg}\n\n2. {fallback_err_msg}"
 
 # 6. Streamlit Main Interface
 # Header Row
@@ -417,52 +413,69 @@ with col_right:
             st.warning("이 포스트는 본문 내용이 비어있거나 파싱할 수 없는 형식입니다.")
             st.stop()
             
-        # TTS Settings Drawer/Expander
+        # Resolve currently selected TTS configurations from Session State
+        voice_options = {
+            "ko-KR-InJoonNeural (남성 - 차분함, 기본)": "ko-KR-InJoonNeural",
+            "ko-KR-SunHiNeural (여성 - 선명함)": "ko-KR-SunHiNeural",
+            "ko-KR-HyunminNeural (남성 - 친근함)": "ko-KR-HyunminNeural"
+        }
+        speed_options = {
+            "0.9x": "-10%",
+            "1.0x (보통)": "+0%",
+            "1.1x": "+10%",
+            "1.2x": "+20%",
+            "1.3x": "+30%",
+            "1.5x": "+50%"
+        }
+        
+        voice_id = voice_options.get(st.session_state.tts_voice, "ko-KR-InJoonNeural")
+        speed_rate = speed_options.get(st.session_state.tts_speed, "+0%")
+        
+        volume_val = st.session_state.tts_volume
+        if volume_val == 100:
+            volume_rate = "+0%"
+        else:
+            volume_rate = f"{volume_val - 100:+.0f}%"
+
+        # TTS Settings Drawer/Expander inside a Form to buffer edits and prevent slider-dragging race conditions
         with st.expander("⚙️ TTS 음성, 속도 및 볼륨 설정", expanded=False):
-            voice_col, speed_col, volume_col = st.columns(3)
-            
-            with voice_col:
-                voice_options = {
-                    "ko-KR-InJoonNeural (남성 - 차분함, 기본)": "ko-KR-InJoonNeural",
-                    "ko-KR-SunHiNeural (여성 - 선명함)": "ko-KR-SunHiNeural",
-                    "ko-KR-HyunminNeural (남성 - 친근함)": "ko-KR-HyunminNeural"
-                }
-                selected_voice_name = st.selectbox(
-                    "음성 선택 (Microsoft AI Voice)",
-                    options=list(voice_options.keys())
-                )
-                voice_id = voice_options[selected_voice_name]
+            with st.form(key="tts_settings_form"):
+                voice_col, speed_col, volume_col = st.columns(3)
                 
-            with speed_col:
-                speed_options = {
-                    "0.9x": "-10%",
-                    "1.0x (보통)": "+0%",
-                    "1.1x": "+10%",
-                    "1.2x": "+20%",
-                    "1.3x": "+30%",
-                    "1.5x": "+50%"
-                }
-                selected_speed_name = st.selectbox(
-                    "재생 속도",
-                    options=list(speed_options.keys()),
-                    index=1 # Default 1.0x
-                )
-                speed_rate = speed_options[selected_speed_name]
+                with voice_col:
+                    voice_keys = list(voice_options.keys())
+                    default_voice_idx = voice_keys.index(st.session_state.tts_voice) if st.session_state.tts_voice in voice_keys else 0
+                    form_voice = st.selectbox(
+                        "음성 선택 (Microsoft AI Voice)",
+                        options=voice_keys,
+                        index=default_voice_idx
+                    )
+                    
+                with speed_col:
+                    speed_keys = list(speed_options.keys())
+                    default_speed_idx = speed_keys.index(st.session_state.tts_speed) if st.session_state.tts_speed in speed_keys else 1
+                    form_speed = st.selectbox(
+                        "재생 속도",
+                        options=speed_keys,
+                        index=default_speed_idx
+                    )
+                    
+                with volume_col:
+                    form_volume = st.slider(
+                        "음량 조절",
+                        min_value=50,
+                        max_value=150,
+                        value=st.session_state.tts_volume,
+                        step=10,
+                        format="%d%%"
+                    )
                 
-            with volume_col:
-                selected_volume = st.slider(
-                    "음량 조절",
-                    min_value=50,
-                    max_value=150,
-                    value=100,
-                    step=10,
-                    format="%d%%"
-                )
-                # Map 100% to "+0%", 120% to "+20%", 80% to "-20%"
-                if selected_volume == 100:
-                    volume_rate = "+0%"
-                else:
-                    volume_rate = f"{selected_volume - 100:+.0f}%"
+                apply_button = st.form_submit_button(label="⚙️ 설정 적용하기", use_container_width=True)
+                if apply_button:
+                    st.session_state.tts_voice = form_voice
+                    st.session_state.tts_speed = form_speed
+                    st.session_state.tts_volume = form_volume
+                    st.rerun()
         
         # Compile full text for TTS conversion
         # Join paragraphs with periods to ensure natural pausing
