@@ -31,8 +31,6 @@ if "tts_voice" not in st.session_state:
     st.session_state.tts_voice = "ko-KR-InJoonNeural (남성 - 차분함, 기본)"
 if "tts_speed" not in st.session_state:
     st.session_state.tts_speed = "1.0x (보통)"
-if "tts_volume" not in st.session_state:
-    st.session_state.tts_volume = 100
 
 # 3. CSS Design System (Theme-aware UI)
 bg_color = "#09090b" if IS_DARK else "#ffffff"
@@ -287,18 +285,17 @@ def scrape_post_content(post_id):
 # 5. TTS Helpers
 import traceback
 
-async def generate_edge_tts(text, output_path, voice, rate, volume):
-    communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)
+async def generate_edge_tts(text, output_path, voice, rate):
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(output_path)
 
-def get_tts_audio(text, post_id, voice, speed_rate, volume_rate="+0%"):
+def get_tts_audio(text, post_id, voice, speed_rate):
     os.makedirs(".cache", exist_ok=True)
     
     # Generate unique cached file name
     safe_voice = voice.replace(":", "_").replace("-", "_")
     safe_rate = speed_rate.replace("+", "p").replace("-", "m").replace("%", "")
-    safe_volume = volume_rate.replace("+", "p").replace("-", "m").replace("%", "")
-    audio_filename = f"audio_{post_id}_{safe_voice}_{safe_rate}_{safe_volume}.mp3"
+    audio_filename = f"audio_{post_id}_{safe_voice}_{safe_rate}.mp3"
     audio_path = os.path.join(".cache", audio_filename)
     
     if os.path.exists(audio_path):
@@ -306,7 +303,7 @@ def get_tts_audio(text, post_id, voice, speed_rate, volume_rate="+0%"):
         
     try:
         # Run async TTS generator synchronously
-        asyncio.run(generate_edge_tts(text, audio_path, voice, speed_rate, volume_rate))
+        asyncio.run(generate_edge_tts(text, audio_path, voice, speed_rate))
         return audio_path, None
     except Exception as e:
         err_msg = f"Edge TTS 오류: {str(e)}"
@@ -430,17 +427,11 @@ with col_right:
         
         voice_id = voice_options.get(st.session_state.tts_voice, "ko-KR-InJoonNeural")
         speed_rate = speed_options.get(st.session_state.tts_speed, "+0%")
-        
-        volume_val = st.session_state.tts_volume
-        if volume_val == 100:
-            volume_rate = "+0%"
-        else:
-            volume_rate = f"{volume_val - 100:+.0f}%"
 
         # TTS Settings Drawer/Expander inside a Form to buffer edits and prevent slider-dragging race conditions
-        with st.expander("⚙️ TTS 음성, 속도 및 볼륨 설정", expanded=False):
+        with st.expander("⚙️ TTS 음성 및 속도 설정", expanded=False):
             with st.form(key="tts_settings_form"):
-                voice_col, speed_col, volume_col = st.columns(3)
+                voice_col, speed_col = st.columns(2)
                 
                 with voice_col:
                     voice_keys = list(voice_options.keys())
@@ -459,22 +450,11 @@ with col_right:
                         options=speed_keys,
                         index=default_speed_idx
                     )
-                    
-                with volume_col:
-                    form_volume = st.slider(
-                        "음량 조절",
-                        min_value=50,
-                        max_value=150,
-                        value=st.session_state.tts_volume,
-                        step=10,
-                        format="%d%%"
-                    )
                 
                 apply_button = st.form_submit_button(label="⚙️ 설정 적용하기", use_container_width=True)
                 if apply_button:
                     st.session_state.tts_voice = form_voice
                     st.session_state.tts_speed = form_speed
-                    st.session_state.tts_volume = form_volume
                     st.rerun()
         
         # Compile full text for TTS conversion
@@ -493,7 +473,7 @@ with col_right:
         audio_status_placeholder = st.empty()
         
         # Audio file path
-        audio_path, tts_warning = get_tts_audio(full_text, selected_post["post_id"], voice_id, speed_rate, volume_rate)
+        audio_path, tts_warning = get_tts_audio(full_text, selected_post["post_id"], voice_id, speed_rate)
         
         if tts_warning:
             st.warning(tts_warning)
