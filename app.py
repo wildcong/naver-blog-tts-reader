@@ -269,12 +269,14 @@ def scrape_post_content(post_id):
                 for line in lines:
                     elements.append({"type": "p", "text": line})
                     
-        # Remove consecutive duplicates
+        # Remove consecutive duplicates & filter out image credits (containing ©)
         cleaned_elements = []
         for el in elements:
             el["text"] = el["text"].replace('\xa0', ' ').replace('\u200b', '')
             el["text"] = re.sub(r'\s+', ' ', el["text"]).strip()
             if el["text"]:
+                if '©' in el["text"]:
+                    continue  # Skip image credit lines
                 if not cleaned_elements or cleaned_elements[-1]["text"] != el["text"]:
                     cleaned_elements.append(el)
                     
