@@ -1,0 +1,278 @@
+name: Keep Awake & New Post Checker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/keep-awake-and-check.yml"
+      - "scripts/check_new_posts.py"
+  schedule:
+    # Run every 30 minutes
+    - cron: "13,43 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --- Step 1: Set up Python & Run RSS New Post Checker ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install requests feedparser beautifulsoup4
+
+      - name: Run New Post Checker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          python scripts/check_new_posts.py
+
+      - name: Commit & Push updated last post ID
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/last_post_id.txt
+          git diff --cached --quiet || git commit -m "chore: update last post ID"
+          git push || echo "No changes to push or push failed"
+
+      # --- Step 2: Set up Node.js & Wake Streamlit app in Playwright ---
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Resolve app URL
+        id: resolve
+        env:
+          STREAMLIT_APP_URL_VAR: ${{ vars.STREAMLIT_APP_URL }}
+          STREAMLIT_APP_URL_SECRET: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          APP_URL="${STREAMLIT_APP_URL_VAR:-$STREAMLIT_APP_URL_SECRET}"
+          if [ -z "$APP_URL" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "STREAMLIT_APP_URL is not configured. Skipping ping."
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "app_url=$APP_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Install Playwright core
+        if: steps.resolve.outputs.skip == 'false'
+        timeout-minutes: 3
+        run: |
+          npm install playwright-core@1.54.2
+
+      - name: Wake Streamlit app in headless browser
+        if: steps.resolve.outputs.skip == 'false'
+        timeout-minutes: 8
+        env:
+          APP_URL: ${{ steps.resolve.outputs.app_url }}
+        run: |
+          cat > wake-streamlit.mjs <<'EOF'
+          import { chromium } from "playwright-core";
+
+          const rawAppUrl = (process.env.APP_URL || "").trim();
+          if (!rawAppUrl) {
+            throw new Error("APP_URL is missing.");
+          }
+
+          const appUrlWithParams = new URL(rawAppUrl);
+          appUrlWithParams.searchParams.set("keepawake", "1");
+          const appUrl = appUrlWithParams.toString();
+
+          const browser = await chromium.launch({
+            channel: "chrome",
+            headless: true,
+          });
+          const page = await browser.newPage({
+            userAgent: "github-actions-keep-awake-browser",
+          });
+          let wakeClicked = false;
+          let streamlitShellSeen = false;
+
+          // Customized regex for Naver Blog TTS Reader app
+          const appReadyRegex = /(Naver|Blog|TTS|Audio|Reader|최신|포스트|목록|읽기|듣기)/i;
+          const authBlockedRegex = /(sign in|log in|continue with google|streamlit.*login|로그인)/i;
+          const shellReadyRegex = /(Hosted with Streamlit|streamlit)/i;
+          const htmlPreview = (value) => (value || "").replace(/\s+/g, " ").slice(0, 160);
+
+          try {
+            const response = await page.goto(appUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: 120000,
+            });
+
+            if (!response) {
+              throw new Error("No initial response was received from the app.");
+            }
+            if (response.status() >= 500) {
+              throw new Error(`Initial app response failed with HTTP ${response.status()}.`);
+            }
+
+            await page.waitForLoadState("networkidle", { timeout: 120000 }).catch(() => {});
+            const maxAttempts = 6;
+            const pollDelayMs = 5000;
+            let lastProbe = null;
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+              const finalUrl = page.url();
+              const bodyText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+              const bodyPreview = htmlPreview(bodyText);
+              const appReady = appReadyRegex.test(bodyText);
+              const authBlocked =
+                /\/-\/login/i.test(finalUrl) ||
+                /share\.streamlit\.io\/-\/auth/i.test(finalUrl) ||
+                authBlockedRegex.test(bodyText);
+
+              if (authBlocked) {
+                throw new Error(
+                  `Streamlit app requires login in this GitHub Actions browser. ` +
+                    `Make the Streamlit app publicly accessible, not only the GitHub repo. ` +
+                    `finalUrl=${finalUrl}, bodyPreview=${bodyPreview || "<empty>"}`
+                );
+              }
+
+              if (appReady) {
+                console.log(`Attempt ${attempt}/${maxAttempts} app UI is visible. bodyPreview=${bodyPreview}`);
+                break;
+              }
+
+              if (shellReadyRegex.test(bodyText)) {
+                streamlitShellSeen = true;
+              }
+
+              const wakeButtonVisible = await page
+                .getByRole("button", {
+                  name: /get this app back up|yes, get this app back up|wake|reboot/i,
+                })
+                .first()
+                .isVisible({ timeout: 1000 })
+                .catch(() => false);
+
+              if (wakeButtonVisible) {
+                console.log(`Attempt ${attempt}/${maxAttempts} sleeping page detected.`);
+                await page
+                  .getByRole("button", {
+                    name: /get this app back up|yes, get this app back up|wake|reboot/i,
+                  })
+                  .first()
+                  .click();
+                wakeClicked = true;
+                await page.waitForLoadState("networkidle", { timeout: 120000 }).catch(() => {});
+                await page.waitForTimeout(3000);
+              }
+
+              const health = await page.request
+                .get(new URL("/_stcore/health", appUrl).toString(), {
+                  headers: { "cache-control": "no-store" },
+                  timeout: 30000,
+                })
+                .then(async (res) => {
+                  return {
+                    status: res.status(),
+                    body: await res.text(),
+                  };
+                })
+                .catch((error) => ({
+                  status: 0,
+                  body: String(error),
+                }));
+
+              const trimmedHealthBody = (health.body || "").trim();
+              const healthPreview = htmlPreview(trimmedHealthBody);
+              const healthOk = health.status === 200 && trimmedHealthBody.toLowerCase() === "ok";
+              const healthReturnedStreamlitShell =
+                health.status === 200 &&
+                (/^<!doctype html/i.test(trimmedHealthBody) || /<html[\s>]/i.test(trimmedHealthBody));
+
+              lastProbe = {
+                finalUrl: page.url(),
+                healthStatus: health.status,
+                healthPreview,
+                bodyPreview,
+              };
+
+              console.log(
+                `Attempt ${attempt}/${maxAttempts} finalUrl=${lastProbe.finalUrl} ` +
+                  `healthStatus=${health.status} healthPreview=${healthPreview || "<empty>"} ` +
+                  `bodyPreview=${bodyPreview || "<empty>"}`
+              );
+
+              if (healthOk) {
+                console.log("Streamlit backend health responded with ok.");
+                break;
+              }
+
+              const refreshedText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
+              if (appReadyRegex.test(refreshedText)) {
+                console.log(`Attempt ${attempt}/${maxAttempts} app UI became visible after probing.`);
+                break;
+              }
+
+              if (healthReturnedStreamlitShell || shellReadyRegex.test(refreshedText)) {
+                streamlitShellSeen = true;
+              }
+
+              if (attempt >= 2 && streamlitShellSeen) {
+                console.log(
+                  `Streamlit shell responded but backend health did not expose ok. ` +
+                    `Treating browser visit as successful keep-awake ping. Last probe=${JSON.stringify(lastProbe)}`
+                );
+                break;
+              }
+
+              if (attempt === maxAttempts) {
+                throw new Error(
+                  `Timed out waiting for Streamlit app UI or backend health. ` +
+                    `wakeClicked=${wakeClicked} Last probe=${JSON.stringify(lastProbe)}`
+                );
+              }
+
+              await page.waitForTimeout(pollDelayMs);
+            }
+
+            const finalText = await page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+            const finalHealth = await page.request
+              .get(new URL("/_stcore/health", appUrl).toString(), {
+                headers: { "cache-control": "no-store" },
+                timeout: 30000,
+              })
+              .then(async (res) => {
+                return {
+                  status: res.status(),
+                  body: await res.text(),
+                };
+              })
+              .catch(() => null);
+            const finalHealthOk =
+              finalHealth &&
+              finalHealth.status === 200 &&
+              (finalHealth.body || "").trim().toLowerCase() === "ok";
+
+            if (!finalHealthOk && !appReadyRegex.test(finalText) && !streamlitShellSeen) {
+              throw new Error(
+                `Streamlit app did not confirm ready state. ` +
+                  `finalUrl=${page.url()}, finalBodyPreview=${htmlPreview(finalText) || "<empty>"}`
+              );
+            }
+          } finally {
+            await browser.close();
+          }
+          EOF
+
+          node wake-streamlit.mjs
