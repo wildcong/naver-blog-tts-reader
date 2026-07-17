@@ -7,7 +7,7 @@ import re
 # Configuration
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7161645581:AAGPm5qc6CTSy9OkU_GduAYFcLzo9twMtzs")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6261478342")
-STREAMLIT_APP_URL = os.environ.get("STREAMLIT_APP_URL", "")
+STREAMLIT_APP_URL = os.environ.get("STREAMLIT_APP_URL", "https://blogtts-sh.streamlit.app")
 
 BLOG_ID = "ranto28"
 RSS_URL = f"https://rss.blog.naver.com/{BLOG_ID}.xml"
@@ -152,11 +152,10 @@ def main():
         else:
             body_text = f"\n\n⚠️ <i>본문 내용을 가져올 수 없습니다. ({scrape_err or '본문 비어있음'})</i>"
 
-        # Build the telegram notification text
-        app_link_text = ""
-        if STREAMLIT_APP_URL:
-            app_url = STREAMLIT_APP_URL if STREAMLIT_APP_URL.startswith("http") else f"https://{STREAMLIT_APP_URL}"
-            app_link_text = f"\n🎙️ <b>오디오 리더에서 듣기:</b> <a href='{app_url}'>바로가기</a>"
+        # Build the telegram notification text (unconditionally rendered with fallback url)
+        app_url_base = STREAMLIT_APP_URL if STREAMLIT_APP_URL else "https://blogtts-sh.streamlit.app"
+        app_url = app_url_base if app_url_base.startswith("http") else f"https://{app_url_base}"
+        app_link_text = f"\n🎙️ <b>오디오 리더에서 듣기:</b> <a href='{app_url}'>바로가기</a>"
 
         message = (
             f"🔔 <b>새로운 블로그 글이 업로드되었습니다!</b>\n\n"
