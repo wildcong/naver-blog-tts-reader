@@ -17,6 +17,24 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+import streamlit.components.v1 as components
+
+# 검색 엔진 인덱싱(구글 검색 노출) 방지 스크립트 주입
+components.html(
+    """
+    <script>
+        if (!window.parent.document.querySelector('meta[name="robots"]')) {
+            const meta = window.parent.document.createElement('meta');
+            meta.name = "robots";
+            meta.content = "noindex, nofollow";
+            window.parent.document.getElementsByTagName('head')[0].appendChild(meta);
+        }
+    </script>
+    """,
+    height=0,
+    width=0,
+)
+
 # 2. Theme State Management
 if "theme" not in st.session_state:
     st.session_state.theme = "dark"
