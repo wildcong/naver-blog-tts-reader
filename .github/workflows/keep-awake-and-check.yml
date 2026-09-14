@@ -134,6 +134,14 @@ jobs:
               const bodyText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
               const bodyPreview = htmlPreview(bodyText);
               const appReady = appReadyRegex.test(bodyText);
+              // The app's own password screen is a healthy, expected response.
+              // Never log in here: this job only wakes the app.
+              const passwordGate = await page.locator('[data-blog-daily-auth]').count() > 0;
+              if (passwordGate) {
+                console.log("Password-protected app is awake.");
+                streamlitShellSeen = true;
+                break;
+              }
               const authBlocked =
                 /\/-\/login/i.test(finalUrl) ||
                 /share\.streamlit\.io\/-\/auth/i.test(finalUrl) ||
@@ -142,7 +150,7 @@ jobs:
               if (authBlocked) {
                 throw new Error(
                   `Streamlit app requires login in this GitHub Actions browser. ` +
-                    `Make the Streamlit app publicly accessible, not only the GitHub repo. ` +
+                    `Check the hosting account's access settings. The app password gate must remain enabled. ` +
                     `finalUrl=${finalUrl}, bodyPreview=${bodyPreview || "<empty>"}`
                 );
               }
