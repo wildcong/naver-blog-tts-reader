@@ -13,6 +13,10 @@ streamlit run app.py
 헤더를 적용하고 공개 음성·업로드 경로를 차단합니다. `reader.py`는
 리더 화면을 담으며 본문 조회·음성 생성 전에 서버에서 인증을 검증합니다.
 
+Cloud에서 서버 미들웨어를 변경한 뒤에는 관리 메뉴의 **Reboot**로 서버를
+재시작합니다. 화면만 다시 실행하면 이미 생성된 미들웨어에 변경이 반영되지
+않을 수 있습니다.
+
 Streamlit Community Cloud의 앱 Settings → Secrets에 아래 서버 설정을
 저장해야 합니다. 로컬에서는 `.streamlit/secrets.toml`에 저장합니다.
 
