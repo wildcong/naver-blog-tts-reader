@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - ".github/workflows/keep-awake-and-check.yml"
+      - "navigation.py"
       - "scripts/check_new_posts.py"
   schedule:
     # Run every 30 minutes
@@ -40,7 +41,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
         run: |
-          python scripts/check_new_posts.py
+          python -m scripts.check_new_posts
 
       - name: Commit & Push updated last post ID
         run: |

@@ -13,6 +13,7 @@ from gtts import gTTS
 from html import escape
 
 from auth import require_access
+from navigation import post_query_params, requested_post_id, select_post
 
 # 1. Page Configuration (Must be first)
 st.set_page_config(
@@ -26,7 +27,7 @@ st.set_page_config(
 require_access()
 
 # 2. Theme State Management
-if "theme" not in st.session_state:
+if st.session_state.get("theme") not in {"dark", "light"}:
     st.session_state.theme = "dark"
 
 def toggle_theme():
@@ -66,6 +67,7 @@ div[data-testid="stSidebarCollapsedControl"] {{
 html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"], .main, .block-container, section[data-testid="stMain"] {{
     background-color: {bg_color} !important;
     color: {text_color} !important;
+    color-scheme: {"dark" if IS_DARK else "light"};
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
 }}
 
@@ -75,13 +77,10 @@ html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"], .main, .b
 }}
 
 /* Brand Styling */
-.brand-container {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding-bottom: 1.25rem;
+.brand-divider {{
     border-bottom: 1px solid {border_color};
     margin-bottom: 1.5rem;
+    padding-top: 0.75rem;
 }}
 .brand-title {{
     font-size: 1.5rem;
@@ -333,11 +332,21 @@ def get_tts_audio(text, post_id, voice, speed_rate):
 
 # 6. Streamlit Main Interface
 # Header Row
-st.markdown(f"""
-<div class="brand-container">
+header_title, header_theme = st.columns([4, 1], vertical_alignment="center")
+with header_title:
+    st.markdown(f"""
     <div class="brand-title">🎙️ Naver Blog <span>Audio Reader</span></div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+with header_theme:
+    theme_label = "☀️ 라이트" if IS_DARK else "🌙 다크"
+    st.button(
+        theme_label,
+        key="theme_toggle",
+        help="화면 색상 모드 전환",
+        on_click=toggle_theme,
+        use_container_width=True,
+    )
+st.markdown('<div class="brand-divider"></div>', unsafe_allow_html=True)
 
 # Main Screen Layout
 # We have a sidebar lists of posts on the left (column 1) and details on the right (column 2)
@@ -354,9 +363,29 @@ if not posts:
     st.info("불러온 블로그 글이 없습니다.")
     st.stop()
 
-# Track selection in Session State
-if "selected_post" not in st.session_state:
-    st.session_state.selected_post = posts[0]
+# Track selection in Session State and honor Telegram/shared deep links. RSS only
+# exposes the latest 50 posts, so keep a valid direct link usable even when the
+# requested post is older than the feed or the five-minute feed cache is stale.
+linked_post_id = requested_post_id(st.query_params)
+if linked_post_id and not any(post["post_id"] == linked_post_id for post in posts):
+    posts = [
+        {
+            "title": f"블로그 글 {linked_post_id}",
+            "link": f"https://blog.naver.com/{BLOG_ID}/{linked_post_id}",
+            "post_id": linked_post_id,
+            "published": "",
+            "description": "",
+        },
+        *posts,
+    ]
+
+current_post = st.session_state.get("selected_post")
+current_post_id = current_post.get("post_id") if isinstance(current_post, dict) else None
+st.session_state.selected_post = select_post(
+    posts,
+    linked_post_id,
+    current_id=current_post_id,
+)
 
 if "list_expanded" not in st.session_state:
     st.session_state.list_expanded = True
@@ -388,6 +417,7 @@ with col_left:
             ):
                 st.session_state.selected_post = post
                 st.session_state.list_expanded = False  # Auto-collapse on mobile when selected
+                st.query_params.update(post_query_params(post["post_id"]))
                 st.rerun()
 
 # --- Right Column: Reader & TTS ---
@@ -500,7 +530,7 @@ with col_right:
             download_name = escape(f"{selected_post['title'][:15]}.mp3", quote=True)
             st.iframe(
                 f"""<!doctype html><html lang="ko"><head><style>
-                body {{ margin: 0; font-family: sans-serif; color: {text_color}; }}
+                body {{ margin: 0; font-family: sans-serif; color: {text_color}; background: {card_color}; }}
                 .player {{ display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
                 audio {{ flex: 1; min-width: 200px; height: 44px; }}
                 a {{ color: {accent_color}; text-decoration: none; font-size: 13px;
@@ -536,11 +566,8 @@ with col_right:
 
         st.markdown(body_html, unsafe_allow_html=True)
 
-# 7. Sidebar Theme Toggle Utility (Alternative representation)
+# 7. Sidebar Utilities
 st.sidebar.markdown("### ⚙️ 시스템 설정")
-theme_label = "☀️ 라이트 모드" if IS_DARK else "🌙 다크 모드"
-st.sidebar.button(theme_label, on_click=toggle_theme, use_container_width=True)
-
 # Clear Cache button
 if st.sidebar.button("🧹 캐시 지우기 (오디오 및 파싱 결과)", use_container_width=True):
     st.cache_data.clear()

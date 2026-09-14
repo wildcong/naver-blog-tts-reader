@@ -1,12 +1,15 @@
 import os
+from html import escape
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 import re
 
+from navigation import build_post_url
+
 # Configuration
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7161645581:AAGPm5qc6CTSy9OkU_GduAYFcLzo9twMtzs")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6261478342")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 STREAMLIT_APP_URL = os.environ.get("STREAMLIT_APP_URL", "https://blogtts-sh.streamlit.app")
 
 BLOG_ID = "ranto28"
@@ -14,7 +17,51 @@ RSS_URL = f"https://rss.blog.naver.com/{BLOG_ID}.xml"
 LAST_ID_FILE = os.path.join("data", "last_post_id.txt")
 
 def escape_html(text):
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return escape(str(text), quote=True)
+
+
+def _escaped_prefix(text, max_length):
+    """Escape complete characters without cutting through an HTML entity."""
+    escaped_parts = []
+    escaped_length = 0
+    for character in str(text):
+        escaped_character = escape_html(character)
+        if escaped_length + len(escaped_character) > max_length:
+            return "".join(escaped_parts), False
+        escaped_parts.append(escaped_character)
+        escaped_length += len(escaped_character)
+    return "".join(escaped_parts), True
+
+
+def format_telegram_body(elements, max_length=3000):
+    """Build valid Telegram HTML within a conservative message budget."""
+    parts = []
+    rendered_length = 0
+
+    for element in elements:
+        separator = "\n\n" if parts else ""
+        element_type = element.get("type")
+        if element_type == "quote":
+            prefix, suffix = "<blockquote>", "</blockquote>"
+        elif element_type == "list-item":
+            prefix, suffix = "• ", ""
+        else:
+            prefix, suffix = "", ""
+
+        available = max_length - rendered_length - len(separator) - len(prefix) - len(suffix)
+        if available <= 0:
+            return "\n\n".join(parts), True
+
+        safe_text, complete = _escaped_prefix(element.get("text", ""), available)
+        if safe_text:
+            parts.append(f"{prefix}{safe_text}{suffix}")
+            rendered_length += len(separator) + len(prefix) + len(safe_text) + len(suffix)
+
+        if not complete:
+            return "\n\n".join(parts), True
+
+    return "\n\n".join(parts), False
+
 
 def scrape_post_content(post_id):
     url = f"https://blog.naver.com/PostView.naver?blogId={BLOG_ID}&logNo={post_id}"
@@ -91,10 +138,14 @@ def send_telegram_message(text):
         response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         print("Telegram message sent successfully.")
-    except Exception as e:
-        print(f"Failed to send Telegram message: {e}")
+    except requests.RequestException:
+        # Do not let request exceptions print the token-bearing API URL.
+        raise RuntimeError("Telegram message delivery failed.") from None
 
 def main():
+    if not BOT_TOKEN:
+        print("TELEGRAM_BOT_TOKEN is not configured.")
+        return
     if not CHAT_ID:
         print("TELEGRAM_CHAT_ID is not configured.")
         return
@@ -133,34 +184,32 @@ def main():
         body_text = ""
         elements, scrape_err = scrape_post_content(post_id)
         if elements:
-            formatted_paras = []
-            for el in elements:
-                text = escape_html(el["text"])
-                if el["type"] == "quote":
-                    formatted_paras.append(f"<blockquote>{text}</blockquote>")
-                elif el["type"] == "list-item":
-                    formatted_paras.append(f"• {text}")
-                else:
-                    formatted_paras.append(text)
-            
-            full_body = "\n\n".join(formatted_paras)
-            # Telegram character limit is 4096, reserve space for headers and links (max 3000 chars)
-            if len(full_body) > 3000:
-                body_text = f"\n\n📖 <b>본문 내용 (일부):</b>\n{full_body[:3000]}...\n\n<i>(본문이 길어 일부 생략되었습니다.)</i>"
+            # Telegram allows 4096 characters. Keep a conservative body budget
+            # and only truncate before adding closing tags or HTML entities.
+            full_body, truncated = format_telegram_body(elements)
+            if truncated:
+                body_text = f"\n\n📖 <b>본문 내용 (일부):</b>\n{full_body}\n\n<i>(본문이 길어 일부 생략되었습니다.)</i>"
             else:
                 body_text = f"\n\n📖 <b>본문 내용:</b>\n{full_body}"
         else:
             body_text = f"\n\n⚠️ <i>본문 내용을 가져올 수 없습니다. ({scrape_err or '본문 비어있음'})</i>"
 
-        # Build the telegram notification text (unconditionally rendered with fallback url)
-        app_url_base = STREAMLIT_APP_URL if STREAMLIT_APP_URL else "https://blogtts-sh.streamlit.app"
-        app_url = app_url_base if app_url_base.startswith("http") else f"https://{app_url_base}"
-        app_link_text = f"\n🎙️ <b>오디오 리더에서 듣기:</b> <a href='{app_url}'>바로가기</a>"
+        # Link straight to the detected post in the authenticated reader.
+        app_url_base = STREAMLIT_APP_URL or "https://blogtts-sh.streamlit.app"
+        try:
+            app_url = build_post_url(app_url_base, post_id)
+        except ValueError as exc:
+            print(f"STREAMLIT_APP_URL is invalid: {exc}")
+            return
+        app_link_text = (
+            "\n🎙️ <b>오디오 리더에서 듣기:</b> "
+            f"<a href='{escape_html(app_url)}'>바로가기</a>"
+        )
 
         message = (
             f"🔔 <b>새로운 블로그 글이 업로드되었습니다!</b>\n\n"
             f"✍️ <b>제목:</b> {escape_html(latest_entry.title)}\n"
-            f"🔗 <b>네이버 블로그 링크:</b> <a href='{link}'>원문 읽기</a>"
+            f"🔗 <b>네이버 블로그 링크:</b> <a href='{escape_html(link)}'>원문 읽기</a>"
             f"{app_link_text}"
             f"{body_text}"
         )
