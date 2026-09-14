@@ -41,8 +41,11 @@ APP_COOKIE_SECRET = "독립적으로 생성한 32자 이상의 임의 비밀키"
   해당 토큰의 재사용도 차단합니다.
 - 로그인 시도 제한은 서버 프로세스 전체에 적용되며 프로세스 재시작 시 초기화됩니다.
 - 모든 HTTP 응답에 `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet`과
-  `Cache-Control: private, no-store`를 적용합니다. 검색 제외 정책은 로그인 전
-  첫 응답에도 포함됩니다. 검색봇이 `noindex`를 확인할 수 있도록 `robots.txt`는
+  `Cache-Control: private, no-store`를 적용합니다. 앱 서버의 검색 제외 정책은
+  로그인 전 첫 HTML에도 메타태그로 포함되어 Cloud가 헤더를 제거해도 유지됩니다.
+  Cloud가 별도로 제공하는 외부 프레임에는
+  브라우저 컴포넌트가 같은 출처의 상위 문서까지 검색 제외 메타태그를 넣습니다.
+  검색봇이 `noindex`를 확인할 수 있도록 `robots.txt`는
   크롤링을 허용하되 본문·음성은 인증으로 차단합니다.
 - 앱의 빈 초기 화면과 실시간 연결은 공개되지만, 인증되지 않은 실행은
   로그인 화면에서 중단되어 본문 조회와 음성 생성이 실행되지 않습니다.

@@ -1,12 +1,14 @@
 """Check the server-validated browser session and private-content boundary."""
 
 import time
+import gzip
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 import pytest
 import streamlit
 from starlette.applications import Starlette
-from starlette.responses import PlainTextResponse
+from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from starlette.routing import Route
 from starlette.testclient import TestClient
 from streamlit.testing.v1 import AppTest
@@ -82,6 +84,65 @@ def test_robots_can_fetch_the_noindex_response(client):
     assert response.status_code == 200
     assert "Allow: /" in response.text
     assert "public Streamlit shell" not in response.text
+    _assert_private_headers(response)
+
+
+@pytest.mark.parametrize("path", ["/", "/index.html"])
+def test_initial_html_carries_noindex_without_relying_on_proxy_headers(path):
+    source = '<!doctype html><html><head><title>블로그 리더</title></head><body>public shell</body></html>'
+    observed_encoding = []
+
+    async def shell(request):
+        accepted = request.headers.get("accept-encoding")
+        observed_encoding.append(accepted)
+        if accepted and "gzip" in accepted:
+            return Response(
+                gzip.compress(source.encode("utf-8")), media_type="text/html",
+                headers={"content-encoding": "gzip"},
+            )
+        return HTMLResponse(source)
+
+    class RobotsMeta(HTMLParser):
+        directives = ""
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "meta" and attrs.get("name", "").lower() == "robots":
+                self.directives = attrs.get("content", "").lower()
+
+    application = PrivacyAuthMiddleware(Starlette(routes=[Route("/{path:path}", shell)]))
+    with TestClient(application, base_url=ORIGIN) as browser:
+        response = browser.get(path, headers={"Accept-Encoding": "gzip"})
+        head = browser.head(path, headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    parser = RobotsMeta()
+    parser.feed(response.text)
+    assert "noindex" in parser.directives
+    assert "nofollow" in parser.directives
+    assert "<title>블로그 리더</title>" in response.text
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert not response.headers.get("content-encoding")
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers["content-length"] == response.headers["content-length"]
+    assert observed_encoding == [None, None]
+
+
+def test_frontend_asset_content_is_unchanged_by_html_protection():
+    source = 'const example = "<head>그대로 유지할 문자열</head>";'
+    observed_encoding = []
+
+    async def asset(request):
+        observed_encoding.append(request.headers.get("accept-encoding"))
+        return Response(source, media_type="application/javascript")
+
+    application = PrivacyAuthMiddleware(Starlette(routes=[Route("/static/app.js", asset)]))
+    with TestClient(application, base_url=ORIGIN) as browser:
+        response = browser.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    assert response.content == source.encode("utf-8")
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert observed_encoding == ["gzip"]
     _assert_private_headers(response)
 
 
@@ -176,6 +237,7 @@ def _assert_locked(app):
 
 def _assert_unlocked(app):
     assert not app.exception
+    assert "private_calls" in app.session_state
     assert app.session_state["private_calls"] > 0
     assert any(PRIVATE_SENTINEL in element.value for element in app.markdown)
 
@@ -287,3 +349,64 @@ def test_missing_configuration_does_not_process_private_data(browser_storage, mo
     app = _private_app().run()
     _assert_locked(app)
     assert app.error
+
+
+@pytest.mark.parametrize("pending_reply", ["none", "previous_read"])
+def test_private_work_waits_for_the_matching_storage_write_ack(
+    browser_storage, monkeypatch, pending_reply,
+):
+    app = _private_app().run()
+    previous_read = browser_storage.commands[-1]
+    release_ack = False
+
+    def delayed_bridge(**kwargs):
+        result = browser_storage(**kwargs)
+        if kwargs["data"]["action"] == "set" and not release_ack:
+            reply = None
+            if pending_reply == "previous_read":
+                reply = {
+                    "id": previous_read["id"], "action": "read",
+                    "available": True, "token": "",
+                }
+            return SimpleNamespace(reply=reply)
+        return result
+
+    monkeypatch.setattr(auth, "_auth_component", lambda: delayed_bridge)
+    _submit_password(app, PASSWORD)
+    _assert_locked(app)
+    release_ack = True
+    app.run()
+    _assert_unlocked(app)
+
+
+@pytest.mark.parametrize("pending_action", ["read", "set"])
+def test_storage_event_before_normal_ack_recovers_with_a_new_read(
+    browser_storage, monkeypatch, settings, pending_action,
+):
+    if pending_action == "read":
+        browser_storage.token = issue_token(settings)
+    replaced_command_id = None
+
+    def event_before_ack(**kwargs):
+        nonlocal replaced_command_id
+        result = browser_storage(**kwargs)
+        command = kwargs["data"]
+        if replaced_command_id is None and command["action"] == pending_action:
+            replaced_command_id = command["id"]
+        if command["id"] == replaced_command_id:
+            return SimpleNamespace(reply={
+                "id": command["id"], "action": "event", "available": True,
+                "token": browser_storage.token, "eventId": "event-replaced-normal-ack",
+            })
+        return result
+
+    monkeypatch.setattr(auth, "_auth_component", lambda: event_before_ack)
+    app = _private_app().run()
+    if pending_action == "set":
+        _submit_password(app, PASSWORD)
+    app.run()
+    _assert_unlocked(app)
+    assert any(
+        command["action"] == "read" and command["id"] != replaced_command_id
+        for command in browser_storage.commands
+    )

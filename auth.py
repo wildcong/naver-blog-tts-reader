@@ -9,6 +9,7 @@ Failure limits and logout revocations are process-local and reset on restart.
 from collections import deque
 from dataclasses import dataclass, field
 from functools import lru_cache
+import gzip
 import hashlib
 import hmac
 import os
@@ -17,6 +18,7 @@ import re
 import secrets
 import threading
 import time
+import zlib
 
 
 SESSION_SECONDS = 30 * 24 * 60 * 60
@@ -282,6 +284,11 @@ def _process_reply(reply, command, settings: AuthSettings) -> bool:
     token = reply.get("token", "")
     if validate_token(token, settings) and not st.session_state.get(_LOCKED_KEY):
         st.session_state[_TOKEN_KEY] = token
+        if action == "event" and st.session_state.get(_REPLY_KEY) != command["id"]:
+            # A simultaneous storage event can replace the command's ack in
+            # component state. Re-read explicitly instead of waiting forever.
+            _command("read")
+            return True
         return False
     # A storage failure cannot undo a freshly verified password in this tab.
     # A reported storage removal/expiry does lock an already open session.
@@ -290,6 +297,9 @@ def _process_reply(reply, command, settings: AuthSettings) -> bool:
         return True
     if token:
         _logout(revoke=False)
+        return True
+    if action == "event" and st.session_state.get(_REPLY_KEY) != command["id"]:
+        _command("read")
         return True
     return False
 
@@ -376,7 +386,13 @@ class PrivacyAuthMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
+        path = scope.get("path", "/")
+        root_html = path in ("/", "/index.html", "/~/+/", "/~/+/index.html") and scope.get("method") in ("GET", "HEAD")
+        pending_start = None
+        body_parts = []
+
         async def private_send(message):
+            nonlocal pending_start
             if message["type"] == "http.response.start":
                 headers = [(key, value) for key, value in message.get("headers", [])
                            if key.lower() not in (b"x-robots-tag", b"cache-control")]
@@ -384,9 +400,39 @@ class PrivacyAuthMiddleware:
                                 (b"cache-control", b"private, no-store"),
                                 (b"x-content-type-options", b"nosniff")])
                 message = {**message, "headers": headers}
+                content_type = next((value for key, value in headers if key.lower() == b"content-type"), b"")
+                if root_html and message["status"] == 200 and content_type.lower().split(b";", 1)[0].strip() == b"text/html":
+                    pending_start = message
+                    return
+            elif message["type"] == "http.response.body" and pending_start is not None:
+                body_parts.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                body = b"".join(body_parts)
+                original_headers = pending_start["headers"]
+                encoding = next((value for key, value in original_headers if key.lower() == b"content-encoding"), b"").lower()
+                try:
+                    if encoding == b"gzip":
+                        body = gzip.decompress(body)
+                    elif encoding not in (b"", b"identity"):
+                        raise ValueError("Unsupported shell encoding")
+                    meta = b'<meta name="robots" content="' + ROBOTS_POLICY.encode() + b'">\n'
+                    closing_head = re.search(br"</head\s*>", body, re.IGNORECASE)
+                    offset = closing_head.start() if closing_head else 0
+                    body = body[:offset] + meta + body[offset:]
+                except (OSError, EOFError, ValueError, zlib.error):
+                    body = b"Service unavailable"
+                    pending_start = {**pending_start, "status": 503}
+                    original_headers = [(key, value) for key, value in original_headers if key.lower() != b"content-type"]
+                    original_headers.append((b"content-type", b"text/plain; charset=utf-8"))
+                changed_headers = [(key, value) for key, value in original_headers
+                                   if key.lower() not in (b"content-length", b"content-encoding", b"etag", b"content-md5")]
+                changed_headers.append((b"content-length", str(len(body)).encode()))
+                await send({**pending_start, "headers": changed_headers})
+                await send({"type": "http.response.body", "body": b"" if scope.get("method") == "HEAD" else body})
+                return
             await send(message)
 
-        path = scope.get("path", "/")
         blocked = ("/media", "/_stcore/upload_file", "/app/static")
         if any(path == prefix or path.startswith(prefix + "/") for prefix in blocked):
             return await self._respond(private_send, 404, b"Not found", scope)
@@ -394,7 +440,19 @@ class PrivacyAuthMiddleware:
             return await self._respond(private_send, 303, b"", scope, [(b"location", b"/")])
         if path == "/robots.txt":
             return await self._respond(private_send, 200, b"User-agent: *\nAllow: /\n", scope)
-        return await self.app(scope, receive, private_send)
+        inner_scope = scope
+        if root_html:
+            # Cloud may remove X-Robots-Tag. Put noindex in the actual initial
+            # HTML too, without patching installed Streamlit assets. Fetch a
+            # complete, uncompressed shell even for a conditional/HEAD probe.
+            inner_scope = {
+                **scope, "method": "GET",
+                "headers": [(key, value) for key, value in scope.get("headers", [])
+                            if key.lower() not in (b"accept-encoding", b"if-none-match", b"if-modified-since", b"range", b"if-range")],
+                "extensions": {key: value for key, value in scope.get("extensions", {}).items()
+                               if key != "http.response.pathsend"},
+            }
+        return await self.app(inner_scope, receive, private_send)
 
     async def _respond(self, send, status, body, scope, headers=None):
         await send({"type": "http.response.start", "status": status, "headers": [

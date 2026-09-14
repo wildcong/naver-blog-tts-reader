@@ -4,6 +4,25 @@ const STORAGE_KEY = "blog_daily_access_v1";
 const MAX_TOKEN_LENGTH = 512;
 
 export default function ({ data, setStateValue }) {
+  // Community Cloud wraps the app in a same-origin document whose response
+  // headers are outside the app server's control. Cover that document too.
+  let frame = window;
+  for (let depth = 0; depth < 5; depth += 1) {
+    try {
+      if (frame.location.origin !== window.location.origin) break;
+      let robots = frame.document.head.querySelector('meta[name="robots"]');
+      if (!robots) {
+        robots = frame.document.createElement("meta");
+        robots.name = "robots";
+        frame.document.head.appendChild(robots);
+      }
+      robots.content = "noindex, nofollow, noarchive, nosnippet";
+      if (frame === frame.parent) break;
+      frame = frame.parent;
+    } catch (_) {
+      break; // Do not modify an unrelated cross-origin embedding page.
+    }
+  }
   if (!data || typeof data.id !== "string" || data.id.length > 64 ||
       !["read", "set", "clear"].includes(data.action)) return;
 
