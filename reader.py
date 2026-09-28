@@ -1,10 +1,5 @@
 import streamlit as st
-import feedparser
-import requests
-from bs4 import BeautifulSoup
-import re
 import os
-import email.utils
 import asyncio
 import base64
 import json
@@ -13,6 +8,8 @@ from gtts import gTTS
 from html import escape
 
 from auth import require_access
+from blog_source import fetch_latest_posts as load_latest_posts
+from blog_source import fetch_post
 from navigation import post_query_params, requested_post_id, select_post
 
 # 1. Page Configuration (Must be first)
@@ -185,115 +182,24 @@ st.markdown(css, unsafe_allow_html=True)
 
 # 4. Helpers for Fetching & Parsing Blog
 BLOG_ID = "ranto28"
-RSS_URL = f"https://rss.blog.naver.com/{BLOG_ID}.xml"
 
-@st.cache_data(ttl=300) # Cache list for 5 minutes
+@st.cache_data(ttl=300, max_entries=2)
 def fetch_latest_posts():
     try:
-        feed = feedparser.parse(RSS_URL)
-        posts = []
-        for entry in feed.entries:
-            # Extract post_id from link
-            link = entry.link
-            post_id = None
-            parts = link.split('/')
-            if len(parts) >= 5:
-                post_id = parts[4].split('?')[0]
+        return load_latest_posts(BLOG_ID), None
+    except Exception as exc:
+        return None, str(exc)
 
-            # Format published date
-            pub_date = ""
-            try:
-                dt = email.utils.parsedate_to_datetime(entry.published)
-                pub_date = dt.strftime("%b %d, %Y %H:%M")
-            except Exception:
-                pub_date = entry.published
 
-            posts.append({
-                "title": entry.title,
-                "link": link,
-                "post_id": post_id,
-                "published": pub_date,
-                "description": entry.description
-            })
-        return posts, None
-    except Exception as e:
-        return None, str(e)
-
-@st.cache_data(ttl=1800) # Cache content for 30 minutes
-def scrape_post_content(post_id):
-    url = f"https://blog.naver.com/PostView.naver?blogId={BLOG_ID}&logNo={post_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.75 Safari/537.36"
-    }
+@st.cache_data(ttl=1800, max_entries=100)
+def fetch_post_details(post_id):
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        main_container = soup.find(class_='se-main-container')
-        if not main_container:
-            main_container = soup.find(id='postViewArea')
-
-        if not main_container:
-            return None, "본문 내용을 찾을 수 없습니다 (Naver SmartEditor 파싱 실패)."
-
-        elements = []
-
-        # Traverse direct children of the container to keep elements in order
-        # Look for components and paragraphs
-        for element in main_container.find_all(recursive=True):
-            classes = element.get('class', [])
-
-            # Only read leaves or distinct components to prevent double-dipping nested divs
-            if 'se-text-paragraph' in classes:
-                # Normal paragraph text
-                text = element.get_text().strip()
-                if text and not element.find(class_='se-text-paragraph'):
-                    elements.append({"type": "p", "text": text})
-            elif 'se-quote-text' in classes:
-                # Blockquotes
-                text = element.get_text().strip()
-                if text:
-                    elements.append({"type": "quote", "text": text})
-            elif 'se-list-item' in classes:
-                # Bullet list items
-                text = element.get_text().strip()
-                if text:
-                    elements.append({"type": "list-item", "text": text})
-
-        # Fallback if specific classes not found
-        if not elements:
-            p_tags = main_container.find_all('p')
-            if p_tags:
-                for p in p_tags:
-                    text = p.get_text().strip()
-                    if text:
-                        elements.append({"type": "p", "text": text})
-            else:
-                # Raw layout lines split
-                lines = [l.strip() for l in main_container.get_text().split('\n') if l.strip()]
-                for line in lines:
-                    elements.append({"type": "p", "text": line})
-
-        # Remove consecutive duplicates & filter out image credits (containing ©)
-        cleaned_elements = []
-        for el in elements:
-            el["text"] = el["text"].replace('\xa0', ' ').replace('\u200b', '')
-            el["text"] = re.sub(r'\s+', ' ', el["text"]).strip()
-            if el["text"]:
-                if '©' in el["text"]:
-                    continue  # Skip image credit lines
-                if not cleaned_elements or cleaned_elements[-1]["text"] != el["text"]:
-                    cleaned_elements.append(el)
-
-        return cleaned_elements, None
-    except Exception as e:
-        return None, str(e)
+        metadata, elements = fetch_post(post_id, BLOG_ID)
+        return metadata, elements, None
+    except Exception as exc:
+        return None, None, str(exc)
 
 # 5. TTS Helpers
-import traceback
-
 async def generate_edge_tts(text, output_path, voice, rate):
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     await communicate.save(output_path)
@@ -344,7 +250,7 @@ with header_theme:
         key="theme_toggle",
         help="화면 색상 모드 전환",
         on_click=toggle_theme,
-        use_container_width=True,
+        width="stretch",
     )
 st.markdown('<div class="brand-divider"></div>', unsafe_allow_html=True)
 
@@ -363,28 +269,32 @@ if not posts:
     st.info("불러온 블로그 글이 없습니다.")
     st.stop()
 
-# Track selection in Session State and honor Telegram/shared deep links. RSS only
-# exposes the latest 50 posts, so keep a valid direct link usable even when the
-# requested post is older than the feed or the five-minute feed cache is stale.
+# Honor an explicit post URL; otherwise always follow the newest RSS post.
+# This prevents a previous browser session from making an older title look like
+# the newest post. RSS only exposes 50 posts, so a missing deep link is resolved
+# against the canonical PostView page before rendering a placeholder.
 linked_post_id = requested_post_id(st.query_params)
+preloaded_post = None
 if linked_post_id and not any(post["post_id"] == linked_post_id for post in posts):
+    metadata, elements, direct_error = fetch_post_details(linked_post_id)
+    preloaded_post = (metadata, elements, direct_error)
+    direct_post = metadata or {
+        "title": f"블로그 글 {linked_post_id}",
+        "link": f"https://blog.naver.com/{BLOG_ID}/{linked_post_id}",
+        "post_id": linked_post_id,
+        "published": "",
+    }
     posts = [
         {
-            "title": f"블로그 글 {linked_post_id}",
-            "link": f"https://blog.naver.com/{BLOG_ID}/{linked_post_id}",
-            "post_id": linked_post_id,
-            "published": "",
+            **direct_post,
             "description": "",
         },
         *posts,
     ]
 
-current_post = st.session_state.get("selected_post")
-current_post_id = current_post.get("post_id") if isinstance(current_post, dict) else None
 st.session_state.selected_post = select_post(
     posts,
     linked_post_id,
-    current_id=current_post_id,
 )
 
 if "list_expanded" not in st.session_state:
@@ -413,7 +323,7 @@ with col_left:
             if st.button(
                 f"{'▶ ' if is_selected else ''}{post['title']}\n({post['published']})",
                 key=f"post_{post['post_id']}_{idx}",
-                use_container_width=True,
+                width="stretch",
             ):
                 st.session_state.selected_post = post
                 st.session_state.list_expanded = False  # Auto-collapse on mobile when selected
@@ -426,8 +336,23 @@ selected_post = st.session_state.selected_post
 with col_right:
     st.markdown(f"### 📖 읽기 및 듣기")
 
-    # Scrape post body
-    post_elements, scrape_err = scrape_post_content(selected_post["post_id"])
+    # Fetch canonical metadata and body together so edited or older posts never
+    # retain a synthetic/stale title.
+    if preloaded_post is not None and selected_post["post_id"] == linked_post_id:
+        post_metadata, post_elements, scrape_err = preloaded_post
+    else:
+        post_metadata, post_elements, scrape_err = fetch_post_details(
+            selected_post["post_id"]
+        )
+
+    if post_metadata:
+        selected_post = {
+            **selected_post,
+            "title": post_metadata["title"],
+            "link": post_metadata["link"],
+            "published": selected_post.get("published") or post_metadata["published"],
+        }
+        st.session_state.selected_post = selected_post
 
     # Design of the Reading panel
     with st.container():
@@ -491,7 +416,10 @@ with col_right:
                         index=default_speed_idx
                     )
 
-                apply_button = st.form_submit_button(label="⚙️ 설정 적용하기", use_container_width=True)
+                apply_button = st.form_submit_button(
+                    label="⚙️ 설정 적용하기",
+                    width="stretch",
+                )
                 if apply_button:
                     st.session_state.tts_voice = form_voice
                     st.session_state.tts_speed = form_speed
@@ -569,7 +497,10 @@ with col_right:
 # 7. Sidebar Utilities
 st.sidebar.markdown("### ⚙️ 시스템 설정")
 # Clear Cache button
-if st.sidebar.button("🧹 캐시 지우기 (오디오 및 파싱 결과)", use_container_width=True):
+if st.sidebar.button(
+    "🧹 캐시 지우기 (오디오 및 파싱 결과)",
+    width="stretch",
+):
     st.cache_data.clear()
     # Remove cached mp3 files
     if os.path.exists(".cache"):

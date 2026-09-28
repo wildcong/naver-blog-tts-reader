@@ -2,7 +2,6 @@
 
 from html import escape
 from html.parser import HTMLParser
-from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
 
 import pytest
@@ -177,18 +176,47 @@ def test_telegram_notification_links_to_the_detected_post_and_escapes_the_href(
     monkeypatch.setattr(check_new_posts, "STREAMLIT_APP_URL", app_base)
     monkeypatch.setattr(check_new_posts, "LAST_ID_FILE", str(tmp_path / "last_post_id.txt"))
     monkeypatch.setattr(
-        check_new_posts.feedparser,
-        "parse",
-        lambda _url: SimpleNamespace(
-            entries=[SimpleNamespace(link=blog_link, title="새 글")]
-        ),
+        check_new_posts,
+        "DELIVERY_STATE_FILE",
+        str(tmp_path / "telegram_delivery.json"),
     )
     monkeypatch.setattr(
         check_new_posts,
-        "scrape_post_content",
-        lambda _post_id: ([{"type": "p", "text": "본문"}], None),
+        "fetch_latest_posts",
+        lambda _blog_id: [
+            {
+                "post_id": post_id,
+                "link": blog_link,
+                "title": "오래된 RSS 제목",
+                "published": "Sep 29, 2026 00:10",
+                "description": "",
+            }
+        ],
     )
-    monkeypatch.setattr(check_new_posts, "send_telegram_message", messages.append)
+    monkeypatch.setattr(
+        check_new_posts,
+        "fetch_post",
+        lambda _post_id, _blog_id: (
+            {
+                "post_id": post_id,
+                "link": blog_link,
+                "title": "새 글",
+                "published": "2026. 9. 29. 00:10",
+            },
+            [{"type": "p", "text": "본문"}],
+        ),
+    )
+    receipt = check_new_posts.TelegramReceipt(
+        message_id=17,
+        chat_fingerprint=f"sha256:{'a' * 64}",
+        sent_at="2026-09-29T00:00:00+00:00",
+    )
+
+    def record_message(message):
+        messages.append(message)
+        return receipt
+
+    monkeypatch.setattr(check_new_posts, "send_telegram_message", record_message)
 
     check_new_posts.main()
 
@@ -199,7 +227,15 @@ def test_telegram_notification_links_to_the_detected_post_and_escapes_the_href(
     parser = _Links()
     parser.feed(messages[0])
     assert expected_url in parser.hrefs
+    assert "새 글" in messages[0]
+    assert "오래된 RSS 제목" not in messages[0]
     assert (tmp_path / "last_post_id.txt").read_text() == post_id
+    delivery_state = check_new_posts.load_delivery_state(
+        tmp_path / "telegram_delivery.json"
+    )
+    assert delivery_state is not None
+    assert delivery_state["post_id"] == post_id
+    assert delivery_state["receipt"]["message_id"] == 17
 
 
 def test_telegram_body_truncation_keeps_entities_and_quote_tags_complete():
@@ -220,26 +256,41 @@ def test_telegram_body_truncation_keeps_entities_and_quote_tags_complete():
 def test_failed_telegram_delivery_does_not_record_the_post(monkeypatch, tmp_path):
     post_id = "123456789"
     last_id_file = tmp_path / "last_post_id.txt"
+    delivery_state_file = tmp_path / "telegram_delivery.json"
     monkeypatch.setattr(check_new_posts, "BOT_TOKEN", "test-token")
     monkeypatch.setattr(check_new_posts, "CHAT_ID", "test-chat")
     monkeypatch.setattr(check_new_posts, "STREAMLIT_APP_URL", "https://reader.example")
     monkeypatch.setattr(check_new_posts, "LAST_ID_FILE", str(last_id_file))
     monkeypatch.setattr(
-        check_new_posts.feedparser,
-        "parse",
-        lambda _url: SimpleNamespace(
-            entries=[
-                SimpleNamespace(
-                    link=f"https://blog.naver.com/ranto28/{post_id}",
-                    title="새 글",
-                )
-            ]
-        ),
+        check_new_posts,
+        "DELIVERY_STATE_FILE",
+        str(delivery_state_file),
     )
     monkeypatch.setattr(
         check_new_posts,
-        "scrape_post_content",
-        lambda _post_id: ([{"type": "p", "text": "본문"}], None),
+        "fetch_latest_posts",
+        lambda _blog_id: [
+            {
+                "post_id": post_id,
+                "link": f"https://blog.naver.com/ranto28/{post_id}",
+                "title": "새 글",
+                "published": "",
+                "description": "",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        check_new_posts,
+        "fetch_post",
+        lambda _post_id, _blog_id: (
+            {
+                "post_id": post_id,
+                "link": f"https://blog.naver.com/ranto28/{post_id}",
+                "title": "새 글",
+                "published": "",
+            },
+            [{"type": "p", "text": "본문"}],
+        ),
     )
     monkeypatch.setattr(
         check_new_posts,
@@ -251,3 +302,98 @@ def test_failed_telegram_delivery_does_not_record_the_post(monkeypatch, tmp_path
         check_new_posts.main()
 
     assert not last_id_file.exists()
+    assert not delivery_state_file.exists()
+
+
+def test_current_post_is_not_fetched_or_resent_without_force(monkeypatch, tmp_path):
+    post_id = "123456789"
+    last_id_file = tmp_path / "last_post_id.txt"
+    last_id_file.write_text(post_id, encoding="utf-8")
+    monkeypatch.setattr(check_new_posts, "BOT_TOKEN", "test-token")
+    monkeypatch.setattr(check_new_posts, "CHAT_ID", "12345")
+    monkeypatch.setattr(check_new_posts, "LAST_ID_FILE", str(last_id_file))
+    monkeypatch.setattr(
+        check_new_posts,
+        "DELIVERY_STATE_FILE",
+        str(tmp_path / "telegram_delivery.json"),
+    )
+    monkeypatch.setattr(
+        check_new_posts,
+        "fetch_latest_posts",
+        lambda _blog_id: [
+            {
+                "post_id": post_id,
+                "link": f"https://blog.naver.com/ranto28/{post_id}",
+                "title": "새 글",
+                "published": "",
+                "description": "",
+            }
+        ],
+    )
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("a current post must not be fetched or resent")
+
+    monkeypatch.setattr(check_new_posts, "fetch_post", unexpected_call)
+    monkeypatch.setattr(check_new_posts, "send_telegram_message", unexpected_call)
+
+    assert check_new_posts.main() is None
+
+
+def test_force_resend_replaces_receipt_for_the_current_post(monkeypatch, tmp_path):
+    post_id = "123456789"
+    blog_link = f"https://blog.naver.com/ranto28/{post_id}"
+    last_id_file = tmp_path / "last_post_id.txt"
+    delivery_state_file = tmp_path / "telegram_delivery.json"
+    last_id_file.write_text(post_id, encoding="utf-8")
+    monkeypatch.setattr(check_new_posts, "BOT_TOKEN", "test-token")
+    monkeypatch.setattr(check_new_posts, "CHAT_ID", "12345")
+    monkeypatch.setattr(check_new_posts, "STREAMLIT_APP_URL", "https://reader.example")
+    monkeypatch.setattr(check_new_posts, "LAST_ID_FILE", str(last_id_file))
+    monkeypatch.setattr(
+        check_new_posts,
+        "DELIVERY_STATE_FILE",
+        str(delivery_state_file),
+    )
+    monkeypatch.setattr(
+        check_new_posts,
+        "fetch_latest_posts",
+        lambda _blog_id: [
+            {
+                "post_id": post_id,
+                "link": blog_link,
+                "title": "RSS 제목",
+                "published": "",
+                "description": "",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        check_new_posts,
+        "fetch_post",
+        lambda _post_id, _blog_id: (
+            {
+                "post_id": post_id,
+                "link": blog_link,
+                "title": "확인된 제목",
+                "published": "",
+            },
+            [{"type": "p", "text": "본문"}],
+        ),
+    )
+    receipt = check_new_posts.TelegramReceipt(
+        message_id=99,
+        chat_fingerprint=f"sha256:{'b' * 64}",
+        sent_at="2026-09-29T01:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        check_new_posts,
+        "send_telegram_message",
+        lambda _message: receipt,
+    )
+
+    assert check_new_posts.main(force_resend=True) == receipt
+    state = check_new_posts.load_delivery_state(delivery_state_file)
+    assert state is not None
+    assert state["title"] == "확인된 제목"
+    assert state["receipt"]["message_id"] == 99
